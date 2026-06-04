@@ -31,7 +31,8 @@ Fetches your page via SSR (raw HTML, no JS execution), strips all the React/Next
 | 🧠 **Keyword extraction** | Weighted TF-IDF across title (5×), headings (4×), description (3×), alts (2×), body (1×) |
 | 🔤 **Bigram detection** | Finds meaningful two-word phrases that appear 2+ times |
 | 🌿 **Stem deduplication** | `artist` and `artists` won't both appear — best form wins |
-| 📋 **Full meta audit** | Title, description, canonical, robots, hreflang, og:*, twitter:card, Schema.org |
+| 📋 **Full meta audit** | Title, description, canonical, robots, hreflang, og:*, twitter:card |
+| 🏷️ **Structured data validator** | Recursively parses every JSON-LD block (incl. `@graph`, arrays, nested entities) + Microdata/RDFa, then checks each type against Google rich-result required/recommended properties |
 | 🔗 **Link analysis** | Internal vs external link counts |
 | 🆚 **Live vs test diff** | Keywords added, removed, risen, fallen — signal changes highlighted |
 | 📄 **Markdown report** | Saved to your current folder as `truelink_YYYY-MM-DD_HH-MM-SS.md` |
@@ -90,7 +91,7 @@ Fetching LIVE: https://yoursite.com/en ... ✔
   Title             Your Page Title ⚠
   Description       Your meta description...
   Canonical         https://yoursite.com/en
-  Schema            WebSite
+  Schema            WebSite, Organization, BreadcrumbList  (3 types, 1 JSON-LD block)
   Word count        324
 
   ── Top 40 Keywords (weighted TF-IDF) ────
@@ -99,11 +100,17 @@ Fetching LIVE: https://yoursite.com/en ... ✔
    3. artists                 █████████████░░░░░░░░░░░  11.63
    ...
 
+  ── Structured Data ───────────────────────
+    1 JSON-LD block(s)
+    ✔ WebSite — valid for rich results
+    ✔ Organization — valid for rich results
+    ✖ BreadcrumbList — missing required: itemListElement
+
   ── SEO Audit ─────────────────────────────
     ⚠ Title too long (83 chars, aim 50-60)
     ✔ Single H1 present
     ✔ Canonical tag present
-    ✔ Schema.org: WebSite
+    ✖ BreadcrumbList: missing required itemListElement — not eligible for rich results
     ✔ og:title present
     ✔ 57 internal links
 

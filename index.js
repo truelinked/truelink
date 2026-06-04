@@ -93,17 +93,118 @@ function extractSpacedText($, selector) {
   return parts.join(" ");
 }
 
+// ─── Rich-result rules ────────────────────────────────────────────────────────
+// Required / recommended properties that drive Google rich-result eligibility.
+// (Pragmatic subset of schema.org + Google's structured-data docs.)
+const RICH_RESULT_RULES = {
+  Article:         { required: ["headline"], recommended: ["image", "datePublished", "dateModified", "author"] },
+  NewsArticle:     { required: ["headline"], recommended: ["image", "datePublished", "dateModified", "author"] },
+  BlogPosting:     { required: ["headline"], recommended: ["image", "datePublished", "dateModified", "author"] },
+  Product:         { required: ["name"], recommended: ["image", "description", "offers", "aggregateRating", "review", "brand", "sku"] },
+  Offer:           { required: ["price", "priceCurrency"], recommended: ["availability", "url", "priceValidUntil"] },
+  AggregateOffer:  { required: ["lowPrice", "priceCurrency"], recommended: ["highPrice", "offerCount"] },
+  BreadcrumbList:  { required: ["itemListElement"], recommended: [] },
+  FAQPage:         { required: ["mainEntity"], recommended: [] },
+  QAPage:          { required: ["mainEntity"], recommended: [] },
+  Question:        { required: ["name", "acceptedAnswer"], recommended: ["answerCount"] },
+  HowTo:           { required: ["name", "step"], recommended: ["image", "totalTime", "tool", "supply"] },
+  Recipe:          { required: ["name", "recipeIngredient", "recipeInstructions"], recommended: ["image", "author", "datePublished", "nutrition", "aggregateRating", "totalTime"] },
+  Event:           { required: ["name", "startDate", "location"], recommended: ["endDate", "image", "offers", "performer", "eventStatus"] },
+  Organization:    { required: ["name"], recommended: ["url", "logo", "sameAs", "contactPoint"] },
+  LocalBusiness:   { required: ["name", "address"], recommended: ["telephone", "openingHours", "geo", "priceRange", "image"] },
+  Person:          { required: ["name"], recommended: ["url", "sameAs"] },
+  WebSite:         { required: ["name", "url"], recommended: ["potentialAction"] },
+  WebPage:         { required: [], recommended: ["name", "description"] },
+  VideoObject:     { required: ["name", "thumbnailUrl", "uploadDate"], recommended: ["description", "duration", "contentUrl", "embedUrl"] },
+  ImageObject:     { required: [], recommended: ["url", "width", "height"] },
+  Review:          { required: ["reviewRating", "author"], recommended: ["itemReviewed", "datePublished"] },
+  AggregateRating: { required: ["ratingValue"], recommended: ["reviewCount", "ratingCount", "bestRating"] },
+  JobPosting:      { required: ["title", "description", "datePosted", "hiringOrganization", "jobLocation"], recommended: ["validThrough", "baseSalary", "employmentType"] },
+};
+
+const ARTICLE_ALIASES = { Article: "Article", NewsArticle: "Article", BlogPosting: "Article" };
+
 // ─── Schema.org extractor ─────────────────────────────────────────────────────
+// Walks every JSON-LD block recursively so @graph arrays, top-level arrays, and
+// nested entities (author, publisher, …) are all captured — not just the root
+// @type. Validates detected entities against rich-result rules. Microdata/RDFa
+// is picked up as a fallback.
 function extractSchema($) {
-  const types = [];
+  const nodes      = [];   // every object that carries an @type
+  const counts     = {};   // type → occurrence count
+  let   blocks     = 0;    // ld+json scripts found
+  let   parseErr   = 0;    // ld+json scripts that failed to parse
+  let   ctxMissing = 0;    // ld+json scripts with no @context
+
+  const typesOf = node => {
+    const t = node["@type"];
+    return t ? (Array.isArray(t) ? t : [t]).map(String) : [];
+  };
+
+  const visit = node => {
+    if (!node || typeof node !== "object") return;
+    if (Array.isArray(node)) { node.forEach(visit); return; }
+    const ts = typesOf(node);
+    if (ts.length) { nodes.push(node); ts.forEach(t => counts[t] = (counts[t] || 0) + 1); }
+    for (const [key, val] of Object.entries(node)) {
+      if (key === "@type") continue;
+      if (val && typeof val === "object") visit(val);
+    }
+  };
+
   $('script[type="application/ld+json"]').each((_, el) => {
+    blocks++;
+    const raw = ($(el).contents().text() || $(el).html() || "")
+      .replace(/[\u0000-\u001F]/g, "");
+    if (!raw.trim()) return;
     try {
-      const data = JSON.parse($(el).html().replace(/[\u0000-\u001F]/g, ""));
-      const t = data["@type"];
-      if (t) types.push(Array.isArray(t) ? t.join(", ") : t);
-    } catch {}
+      const data = JSON.parse(raw);
+      const hasCtx = JSON.stringify(data).includes("schema.org");
+      if (!hasCtx) ctxMissing++;
+      visit(data);
+    } catch { parseErr++; }
   });
-  return types;
+
+  // Microdata + RDFa fallback (Google still consumes these).
+  $("[itemscope][itemtype], [typeof]").each((_, el) => {
+    const attr = $(el).attr("itemtype") || $(el).attr("typeof") || "";
+    attr.split(/\s+/).filter(Boolean).forEach(u => {
+      const name = u.split(/[\/#:]/).filter(Boolean).pop();
+      if (name) counts[name] = (counts[name] || 0) + 1;
+    });
+  });
+
+  return {
+    types       : Object.keys(counts).sort((a, b) => a.localeCompare(b)),
+    counts,
+    validation  : validateSchema(nodes),
+    jsonLdBlocks: blocks,
+    parseErrors : parseErr,
+    ctxMissing,
+  };
+}
+
+// ─── Rich-result validation ───────────────────────────────────────────────────
+// Aggregates missing required/recommended props per type across all instances.
+function validateSchema(nodes) {
+  const has = (node, p) => {
+    const v = node[p];
+    return v !== undefined && v !== null && v !== "" &&
+           !(Array.isArray(v) && v.length === 0);
+  };
+  const byType = {};
+  for (const node of nodes) {
+    const ts = Array.isArray(node["@type"]) ? node["@type"] : [node["@type"]];
+    for (const type of ts.map(String)) {
+      const rule = RICH_RESULT_RULES[type];
+      if (!rule) continue;
+      const b = byType[type] || (byType[type] = { count: 0, missingRequired: {}, missingRecommended: {} });
+      b.count++;
+      rule.required.forEach(p => { if (!has(node, p)) b.missingRequired[p] = (b.missingRequired[p] || 0) + 1; });
+      rule.recommended.forEach(p => { if (!has(node, p)) b.missingRecommended[p] = (b.missingRecommended[p] || 0) + 1; });
+    }
+  }
+  return byType;
 }
 
 // ─── Social meta ──────────────────────────────────────────────────────────────
@@ -151,7 +252,7 @@ function cleanText(raw) {
 
 // ─── Full signal extraction ───────────────────────────────────────────────────
 function extractSignals($, url) {
-  const schemaTypes = extractSchema($);
+  const schema      = extractSchema($);
   const socialMeta  = extractSocialMeta($);
   const links       = extractLinks($, url);
 
@@ -182,7 +283,9 @@ function extractSignals($, url) {
     h3          : $("h3").map((_, el) => $(el).text().trim()).get(),
     imgAlts     : $("img[alt]").map((_, el) => $(el).attr("alt").trim()).get().filter(Boolean),
     wordCount   : bodyText.split(/\s+/).filter(Boolean).length,
-    schemaTypes, socialMeta, links,
+    schemaTypes : schema.types,
+    schema,
+    socialMeta, links,
     bodyText, headingText, altText,
   };
 }
@@ -268,8 +371,24 @@ function seoAudit(signals) {
   if (signals.imgAlts.length === 0) warns.push("No images with alt text found");
   else passes.push(`${signals.imgAlts.length} images have alt text`);
 
-  if (signals.schemaTypes.length === 0) warns.push("No Schema.org structured data found");
-  else passes.push(`Schema.org: ${signals.schemaTypes.join(", ")}`);
+  const schema = signals.schema || { types: [], counts: {}, validation: {}, jsonLdBlocks: 0, parseErrors: 0, ctxMissing: 0 };
+  if (schema.types.length === 0) warns.push("No Schema.org structured data found");
+  else passes.push(`Schema.org (${schema.types.length} types): ${schema.types.join(", ")}`);
+  if (schema.parseErrors)
+    issues.push(`${schema.parseErrors} JSON-LD block(s) failed to parse — invalid structured data`);
+  if (schema.ctxMissing)
+    warns.push(`${schema.ctxMissing} JSON-LD block(s) missing schema.org @context`);
+
+  Object.entries(schema.validation).forEach(([type, v]) => {
+    const req = Object.entries(v.missingRequired);
+    const rec = Object.entries(v.missingRecommended);
+    if (req.length)
+      issues.push(`${type}: missing required ${req.map(([p, n]) => v.count > 1 ? `${p} (${n}/${v.count})` : p).join(", ")} — not eligible for rich results`);
+    else if (rec.length)
+      warns.push(`${type}: missing recommended ${rec.map(([p]) => p).join(", ")}`);
+    else
+      passes.push(`${type} structured data valid for rich results`);
+  });
 
   if (!signals.socialMeta.ogTitle)       warns.push("No og:title tag");
   else                                   passes.push("og:title present");
@@ -322,13 +441,20 @@ function printReport(label, url, signals, keywords, audit) {
   const titleWarn = !signals.title || signals.title.length < 30 || signals.title.length > 60;
   const descWarn  = !signals.description || signals.description.length < 70 || signals.description.length > 160;
 
+  const sm = signals.schema || { types: [], counts: {}, validation: {}, jsonLdBlocks: 0, parseErrors: 0, ctxMissing: 0 };
+  const schemaSummary = sm.types.length
+    ? `${sm.types.map(t => sm.counts[t] > 1 ? `${t}×${sm.counts[t]}` : t).join(", ")}`
+      + `  (${sm.types.length} types, ${sm.jsonLdBlocks} JSON-LD block${sm.jsonLdBlocks === 1 ? "" : "s"}`
+      + (sm.parseErrors ? `, ${sm.parseErrors} invalid` : "") + ")"
+    : "none";
+
   logField("Title",          signals.title, titleWarn);
   logField("Description",    signals.description.slice(0, 110) + (signals.description.length > 110 ? "…" : ""), descWarn);
   logField("Canonical",      signals.canonical || "(none)", !signals.canonical);
   logField("Robots",         signals.robots || "(default: index,follow)");
   logField("hreflang",       signals.hreflang || "none");
   logField("Keywords meta",  signals.keywords || "none");
-  logField("Schema",         signals.schemaTypes.join(", ") || "none", !signals.schemaTypes.length);
+  logField("Schema",         schemaSummary, !signals.schemaTypes.length || !!sm.parseErrors);
   logField("og:title",       signals.socialMeta.ogTitle || "none", !signals.socialMeta.ogTitle);
   logField("og:type",        signals.socialMeta.ogType || "none");
   logField("og:image",       signals.socialMeta.ogImage ? "✔ present" : "none", !signals.socialMeta.ogImage);
@@ -342,13 +468,51 @@ function printReport(label, url, signals, keywords, audit) {
   mdField("Canonical",      signals.canonical || "(none)", !signals.canonical);
   mdField("Robots",         signals.robots || "(default: index,follow)");
   mdField("hreflang",       signals.hreflang || "none");
-  mdField("Schema",         signals.schemaTypes.join(", ") || "none", !signals.schemaTypes.length);
+  mdField("Schema",         schemaSummary, !signals.schemaTypes.length || !!sm.parseErrors);
   mdField("og:title",       signals.socialMeta.ogTitle || "none", !signals.socialMeta.ogTitle);
   mdField("og:image",       signals.socialMeta.ogImage ? "✔ present" : "none", !signals.socialMeta.ogImage);
   mdField("twitter:card",   signals.socialMeta.twitterCard || "none", !signals.socialMeta.twitterCard);
   mdField("Word count",     String(signals.wordCount), signals.wordCount < 100);
   mdField("Internal links", String(signals.links.internal.length));
   mdField("External links", String(signals.links.external.length));
+
+  // ── Structured Data
+  console.log(chalk.cyan("\n  ── Structured Data ───────────────────────"));
+  md("\n### Structured Data\n");
+  if (!sm.types.length) {
+    console.log(chalk.yellow("    ⚠ No Schema.org structured data found"));
+    md("⚠️ No Schema.org structured data found");
+  } else {
+    console.log(chalk.gray(`    ${sm.jsonLdBlocks} JSON-LD block(s)`)
+      + (sm.parseErrors ? chalk.red(`, ${sm.parseErrors} invalid`) : "")
+      + (sm.ctxMissing ? chalk.yellow(`, ${sm.ctxMissing} without @context`) : ""));
+    md(`_${sm.jsonLdBlocks} JSON-LD block(s)`
+      + (sm.parseErrors ? `, ${sm.parseErrors} invalid` : "")
+      + (sm.ctxMissing ? `, ${sm.ctxMissing} without @context` : "") + `_\n`);
+    md("| Type | Count | Rich-result status |");
+    md("|---|---:|---|");
+    sm.types.forEach(type => {
+      const v = sm.validation[type];
+      let status, icon;
+      if (!v) {
+        status = RICH_RESULT_RULES[type] ? "declared via microdata (properties not validated)" : "not a rich-result type";
+        icon = chalk.gray("·");
+      }
+      else if (Object.keys(v.missingRequired).length) {
+        const miss = Object.keys(v.missingRequired).join(", ");
+        status = `missing required: ${miss}`; icon = chalk.red("✖");
+      }
+      else if (Object.keys(v.missingRecommended).length) {
+        const miss = Object.keys(v.missingRecommended).join(", ");
+        status = `missing recommended: ${miss}`; icon = chalk.yellow("⚠");
+      }
+      else                                          { status = "valid for rich results"; icon = chalk.green("✔"); }
+      const cnt = sm.counts[type] > 1 ? chalk.gray(` ×${sm.counts[type]}`) : "";
+      console.log(`    ${icon} ${type}${cnt}` + chalk.gray(` — ${status}`));
+      const mdIcon = !v ? "·" : Object.keys(v.missingRequired).length ? "❌" : Object.keys(v.missingRecommended).length ? "⚠️" : "✅";
+      md(`| ${mdIcon} ${type} | ${sm.counts[type]} | ${status} |`);
+    });
+  }
 
   // ── Headings
   console.log(chalk.cyan("\n  ── Headings ──────────────────────────────"));
@@ -425,6 +589,21 @@ function diffReports(liveS, testS, liveKws, testKws) {
     md("**↕ H1**");
     md(`- live: \`${liveS.h1.join(" | ")}\``);
     md(`- test: \`${testS.h1.join(" | ")}\``);
+  }
+  if (liveS.schemaTypes.join("|") !== testS.schemaTypes.join("|")) {
+    changes++;
+    const dropped = liveS.schemaTypes.filter(t => !testS.schemaTypes.includes(t));
+    const gained  = testS.schemaTypes.filter(t => !liveS.schemaTypes.includes(t));
+    console.log(chalk.yellow("\n  ↕  Schema.org"));
+    console.log(chalk.gray("     live: ") + (liveS.schemaTypes.join(", ") || "none"));
+    console.log(chalk.gray("     test: ") + (testS.schemaTypes.join(", ") || "none"));
+    if (dropped.length) console.log(chalk.red("     ✖ dropped: ") + dropped.join(", "));
+    if (gained.length)  console.log(chalk.green("     ✚ added:   ") + gained.join(", "));
+    md("**↕ Schema.org**");
+    md(`- live: \`${liveS.schemaTypes.join(", ") || "none"}\``);
+    md(`- test: \`${testS.schemaTypes.join(", ") || "none"}\``);
+    if (dropped.length) md(`- ❌ dropped: ${dropped.join(", ")}`);
+    if (gained.length)  md(`- ✅ added: ${gained.join(", ")}`);
   }
   if (!changes) {
     console.log(chalk.green("    ✔ No meta/heading changes"));
