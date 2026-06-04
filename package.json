@@ -1,0 +1,12 @@
+{
+    "name": "truelink",
+    "version": "1.0.0",
+    "description": "SEO keyword extractor and diff tool",
+    "bin": { "truelink": "./index.js" },
+    "license": "MIT",
+    "keywords": ["seo", "keyword", "diff", "tfidf"],
+    "repository": {
+      "type": "git",
+      "url": "https://github.com/you/truelink"
+    }
+  }
