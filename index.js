@@ -251,10 +251,24 @@ function cleanText(raw) {
 }
 
 // ─── Full signal extraction ───────────────────────────────────────────────────
-function extractSignals($, url) {
+function extractSignals($, url, rawHtml = "") {
   const schema      = extractSchema($);
   const socialMeta  = extractSocialMeta($);
   const links       = extractLinks($, url);
+
+  // ── Render metrics (measured on the raw SSR payload, before we strip nodes).
+  // These reveal how much real content is in the HTML vs how much is JS/markup —
+  // the key signal when moving from client-side to server-side rendering.
+  const html        = rawHtml || $.html() || "";
+  const htmlBytes    = Buffer.byteLength(html, "utf8");
+  const scriptBytes  = $("script").toArray()
+    .reduce((n, el) => n + Buffer.byteLength($(el).html() || "", "utf8"), 0);
+  const framework =
+    /__NEXT_DATA__|\/_next\//.test(html)              ? "Next.js"  :
+    /window\.__NUXT__|\/_nuxt\//.test(html)           ? "Nuxt"     :
+    /ng-version=|\/runtime\.[0-9a-f]+\.js/.test(html) ? "Angular"  :
+    /data-reactroot|id="root"/.test(html)             ? "React"    :
+    /data-sveltekit|__sveltekit/.test(html)           ? "SvelteKit": null;
 
   $("script, style, noscript, iframe, svg, canvas, template, " +
     "[aria-hidden='true'], [class*='hidden'], [id*='hidden'], " +
@@ -271,6 +285,24 @@ function extractSignals($, url) {
     $("img[alt]").map((_, el) => $(el).attr("alt").trim()).get().filter(Boolean).join(" ")
   );
 
+  const textBytes      = Buffer.byteLength(rawBody, "utf8");
+  const wordCount      = bodyText.split(/\s+/).filter(Boolean).length;
+  const textRatio      = htmlBytes ? textBytes / htmlBytes : 0;
+  const scriptRatio    = htmlBytes ? scriptBytes / htmlBytes : 0;
+  // Content density measured against *non-script* markup — text vs <script> is a
+  // performance/bloat number, this is "is your markup mostly content or div-soup".
+  const nonScriptBytes = Math.max(1, htmlBytes - scriptBytes);
+  const contentRatio   = textBytes / nonScriptBytes;
+  // Blunt, intuitive engineer metric: bytes of HTML shipped per indexable word.
+  const bytesPerWord   = wordCount ? htmlBytes / wordCount : htmlBytes;
+  // Conservative: only call it a shell when content is genuinely thin AND the
+  // payload is JS-dominated, so SSR pages that happen to use a framework pass.
+  const csrShellLikely = wordCount < 150 && (scriptRatio > 0.5 || textRatio < 0.04);
+  const render = {
+    htmlBytes, textBytes, textRatio, scriptBytes, scriptRatio,
+    nonScriptBytes, contentRatio, bytesPerWord, framework, csrShellLikely,
+  };
+
   return {
     title       : $("title").first().text().trim(),
     description : $('meta[name="description"]').attr("content") || "",
@@ -282,9 +314,9 @@ function extractSignals($, url) {
     h2          : $("h2").map((_, el) => $(el).text().trim()).get(),
     h3          : $("h3").map((_, el) => $(el).text().trim()).get(),
     imgAlts     : $("img[alt]").map((_, el) => $(el).attr("alt").trim()).get().filter(Boolean),
-    wordCount   : bodyText.split(/\s+/).filter(Boolean).length,
+    wordCount,
     schemaTypes : schema.types,
-    schema,
+    schema, render,
     socialMeta, links,
     bodyText, headingText, altText,
   };
@@ -342,6 +374,62 @@ function scoreKeywords(signals, topN = TOP_N) {
     .sort((a, b) => b.score - a.score)
     .slice(0, topN)
     .map(({ kw, score }) => ({ kw, score: +score.toFixed(2) }));
+}
+
+// ─── Human-readable bytes ─────────────────────────────────────────────────────
+function fmtBytes(n) {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / 1024 / 1024).toFixed(2)} MB`;
+}
+
+// ─── Blunt payload verdict ────────────────────────────────────────────────────
+// Engineers ignore "0/100". They don't ignore "you ship 2.5 MB to render 1536
+// words". This translates the raw numbers into a verdict that's hard to wave off.
+function renderVerdict(r, wordCount) {
+  const bpw       = Math.round(r.bytesPerWord);
+  const scriptPct = Math.round(r.scriptRatio * 100);
+  const sizeStr   = fmtBytes(r.htmlBytes);
+  const bpwStr    = fmtBytes(bpw);
+
+  if (r.csrShellLikely)
+    return { severity: "bad", grade: "CSR SHELL",
+      headline: `${wordCount} words in ${sizeStr} of HTML — the content isn't server-rendered. A crawler sees an empty shell; whatever users see is painted later by JS it never runs.` };
+
+  if (bpw > 2000 || scriptPct >= 90)
+    return { severity: "bad", grade: "BLOATED",
+      headline: `${sizeStr} of HTML to deliver ${wordCount} words — that's ${bpwStr} per word, ${scriptPct}% JavaScript. You're shipping a bundle to surface a paragraph; the content is real but drowning in JS.` };
+
+  if (bpw > 800 || scriptPct >= 75)
+    return { severity: "warn", grade: "HEAVY",
+      headline: `${bpwStr} per word, ${scriptPct}% JavaScript — content is there but buried under markup/JS. Trim the payload.` };
+
+  return { severity: "ok", grade: "LEAN",
+    headline: `${bpwStr} per word, ${scriptPct}% JavaScript — content-first HTML, crawler-friendly.` };
+}
+
+// ─── Content / SSR readiness score ────────────────────────────────────────────
+// Unlike the technical checklist, this measures how much real, indexable content
+// is in the raw SSR HTML — the number that should rise as CSR content moves to SSR.
+// Components are intentionally transparent so the breakdown can be shown + tuned.
+function contentScore(signals) {
+  const wc = signals.wordCount;
+  const r  = signals.render || { textRatio: 0 };
+  const tr = r.textRatio;
+
+  // Content density vs non-script markup — realistic spread (real pages land
+  // ~4–35%), unlike text/total-HTML which pins every JS app near 0 and gets ignored.
+  const cr = r.contentRatio || 0;
+  const crPts = cr >= 0.30 ? 45 : cr >= 0.20 ? 36 : cr >= 0.12 ? 27 : cr >= 0.06 ? 18 : cr >= 0.03 ? 9 : 0; // 0-45
+  const wcPts = wc >= 800 ? 35 : wc >= 400 ? 30 : wc >= 300 ? 25 : wc >= 150 ? 15 : wc >= 50 ? 6 : 0;        // 0-35
+  const hPts  = Math.min(12, (signals.h1.length ? 6 : 0) + Math.min(6, signals.h2.length * 2));               // 0-12
+  const lPts  = signals.links.internal.length >= 10 ? 8 : signals.links.internal.length >= 3 ? 5 : signals.links.internal.length >= 1 ? 2 : 0; // 0-8
+
+  // Bloat penalty: shipping a JS bundle to deliver a paragraph should hurt the score.
+  const bloatPenalty = r.csrShellLikely ? 30 : r.bytesPerWord > 2000 ? 20 : r.bytesPerWord > 800 ? 10 : 0;
+
+  const total = Math.max(0, Math.min(100, crPts + wcPts + hPts + lPts - bloatPenalty));
+  return { total: Math.round(total), wcPts, crPts, hPts, lPts, bloatPenalty };
 }
 
 // ─── SEO audit ────────────────────────────────────────────────────────────────
@@ -407,11 +495,20 @@ function seoAudit(signals) {
   if (iLinks === 0) warns.push("No internal links found");
   else passes.push(`${iLinks} internal links`);
 
-  const seoScore = Math.round(
+  // ── Render / payload verdict (raw HTML = what a crawler sees, no JS executed)
+  const r = signals.render;
+  if (r) {
+    const v = renderVerdict(r, signals.wordCount);
+    if (v.severity === "bad")       issues.push(`${v.grade}: ${v.headline}`);
+    else if (v.severity === "warn") warns.push(`${v.grade}: ${v.headline}`);
+    else                            passes.push(`${v.grade}: ${v.headline}`);
+  }
+
+  const metaScore = Math.round(
     100 * passes.length / (passes.length + warns.length * 0.5 + issues.length * 1)
   );
 
-  return { issues, warns, passes, seoScore };
+  return { issues, warns, passes, metaScore, seoScore: metaScore, contentScore: contentScore(signals) };
 }
 
 // ─── Print + write report ─────────────────────────────────────────────────────
@@ -463,6 +560,14 @@ function printReport(label, url, signals, keywords, audit) {
   logField("Internal links", String(signals.links.internal.length));
   logField("External links", String(signals.links.external.length));
 
+  const rnd = signals.render || { htmlBytes: 0, contentRatio: 0, scriptRatio: 0, bytesPerWord: 0, framework: null, csrShellLikely: false };
+  const verdict = renderVerdict(rnd, signals.wordCount);
+  const vColor = verdict.severity === "bad" ? chalk.red : verdict.severity === "warn" ? chalk.yellow : chalk.green;
+  logField("Payload",        `${fmtBytes(rnd.htmlBytes)} · ${fmtBytes(Math.round(rnd.bytesPerWord))}/word · ${(rnd.scriptRatio * 100).toFixed(0)}% JS`, verdict.severity !== "ok");
+  logField("Content density",`${(rnd.contentRatio * 100).toFixed(1)}% text vs markup`, rnd.contentRatio < 0.06);
+  logField("Render",         (rnd.framework ? `${rnd.framework} · ` : "") + vColor(verdict.grade), verdict.severity !== "ok");
+  console.log("    " + vColor(verdict.headline));
+
   mdField("Title",          signals.title, titleWarn);
   mdField("Description",    signals.description.slice(0, 160) || "(empty)", descWarn);
   mdField("Canonical",      signals.canonical || "(none)", !signals.canonical);
@@ -475,6 +580,9 @@ function printReport(label, url, signals, keywords, audit) {
   mdField("Word count",     String(signals.wordCount), signals.wordCount < 100);
   mdField("Internal links", String(signals.links.internal.length));
   mdField("External links", String(signals.links.external.length));
+  mdField("Payload",        `${fmtBytes(rnd.htmlBytes)} · ${fmtBytes(Math.round(rnd.bytesPerWord))}/word · ${(rnd.scriptRatio * 100).toFixed(0)}% JS`, verdict.severity !== "ok");
+  mdField("Content density",`${(rnd.contentRatio * 100).toFixed(1)}% text vs markup`, rnd.contentRatio < 0.06);
+  mdField("Render",         `${rnd.framework ? rnd.framework + " · " : ""}**${verdict.grade}** — ${verdict.headline}`, verdict.severity !== "ok");
 
   // ── Structured Data
   console.log(chalk.cyan("\n  ── Structured Data ───────────────────────"));
@@ -553,20 +661,28 @@ function printReport(label, url, signals, keywords, audit) {
   audit.warns .forEach(w => { console.log(chalk.yellow("    ⚠ ") + w); md(`- ⚠️  ${w}`); });
   audit.passes.forEach(p => { console.log(chalk.green("    ✔ ")  + p); md(`- ✅ ${p}`); });
 
-  const color = audit.seoScore >= 80 ? chalk.green : audit.seoScore >= 50 ? chalk.yellow : chalk.red;
-  console.log("\n  " + color.bold(`SEO Score: ${audit.seoScore}/100`));
-  md(`\n> **SEO Score: ${audit.seoScore}/100**\n`);
+  const tint = s => s >= 80 ? chalk.green : s >= 50 ? chalk.yellow : chalk.red;
+  const cs = audit.contentScore;
+  const csBreakdown = `density ${cs.crPts}/45 · content ${cs.wcPts}/35 · headings ${cs.hPts}/12 · links ${cs.lPts}/8`
+    + (cs.bloatPenalty ? ` · bloat penalty −${cs.bloatPenalty}` : "");
+
+  console.log("\n  " + tint(audit.metaScore).bold(`Technical SEO (tags/meta): ${audit.metaScore}/100`));
+  console.log("  " + tint(cs.total).bold(`Content / SSR readiness:   ${cs.total}/100`) + chalk.gray(`   (${csBreakdown})`));
+
+  md(`\n> **Technical SEO (tags/meta): ${audit.metaScore}/100**`);
+  md(`>`);
+  md(`> **Content / SSR readiness: ${cs.total}/100** — _${csBreakdown}_\n`);
 }
 
 // ─── Diff ─────────────────────────────────────────────────────────────────────
-function diffReports(liveS, testS, liveKws, testKws) {
+function diffReports(liveS, testS, liveKws, testKws, liveAudit, testAudit) {
   console.log("\n" + chalk.bgYellow.black.bold(" ── DIFF: live → test ── "));
   md(`\n---\n\n## DIFF: live → test\n`);
 
   // Signal diff
   console.log(chalk.cyan("\n  ── Signal Changes ────────────────────────"));
   md("\n### Signal Changes\n");
-  const metaFields = ["title", "description", "canonical", "robots", "wordCount"];
+  const metaFields = ["title", "description", "canonical", "robots"];
   let changes = 0;
   metaFields.forEach(f => {
     const lv = String(liveS[f] || ""), tv = String(testS[f] || "");
@@ -581,6 +697,41 @@ function diffReports(liveS, testS, liveKws, testKws) {
       md("");
     }
   });
+  // ── Indexable content / payload (the migration KPI)
+  {
+    const lr = liveS.render, tr = testS.render;
+    const lw = liveS.wordCount, tw = testS.wordCount;
+    const lc = contentScore(liveS).total, tc = contentScore(testS).total;
+    const lbpw = Math.round(lr.bytesPerWord), tbpw = Math.round(tr.bytesPerWord);
+    if (lw !== tw || lc !== tc || lbpw !== tbpw || lr.htmlBytes !== tr.htmlBytes) {
+      changes++;
+      const mult = lw > 0 ? (tw / lw) : (tw > 0 ? Infinity : 1);
+      const multStr = isFinite(mult) ? `${mult.toFixed(1)}×` : "∞";
+      const up = (a, b) => b > a ? chalk.green("▲") : b < a ? chalk.red("▼") : "=";
+      const down = (a, b) => b < a ? chalk.green("▲") : b > a ? chalk.red("▼") : "="; // lower is better
+      console.log(chalk.yellow("\n  ↕  Indexable content & payload"));
+      console.log(`     ${up(lw, tw)} words:          ${lw} → ${tw}` + chalk.gray(`  (${multStr})`));
+      console.log(`     ${down(lr.htmlBytes, tr.htmlBytes)} page size:      ${fmtBytes(lr.htmlBytes)} → ${fmtBytes(tr.htmlBytes)}`);
+      console.log(`     ${down(lbpw, tbpw)} bytes/word:     ${fmtBytes(lbpw)} → ${fmtBytes(tbpw)}`);
+      console.log(`     ${up(lc, tc)} content score:  ${lc} → ${tc}`);
+      if (liveS.render.csrShellLikely && !testS.render.csrShellLikely)
+        console.log(chalk.green("     ✔ test moves content into SSR HTML (no longer a CSR shell)"));
+      if (!liveS.render.csrShellLikely && testS.render.csrShellLikely)
+        console.log(chalk.red("     ✖ test regressed to a CSR shell"));
+
+      md("**↕ Indexable content & payload**");
+      md(`- words: ${lw} → ${tw} (${multStr})`);
+      md(`- page size: ${fmtBytes(lr.htmlBytes)} → ${fmtBytes(tr.htmlBytes)}`);
+      md(`- bytes/word: ${fmtBytes(lbpw)} → ${fmtBytes(tbpw)}`);
+      md(`- content score: ${lc} → ${tc}`);
+      if (liveS.render.csrShellLikely && !testS.render.csrShellLikely)
+        md(`- ✅ test moves content into SSR HTML (no longer a CSR shell)`);
+      if (!liveS.render.csrShellLikely && testS.render.csrShellLikely)
+        md(`- ❌ test regressed to a CSR shell`);
+      md("");
+    }
+  }
+
   if (liveS.h1.join("|") !== testS.h1.join("|")) {
     changes++;
     console.log(chalk.yellow("\n  ↕  H1"));
@@ -590,20 +741,52 @@ function diffReports(liveS, testS, liveKws, testKws) {
     md(`- live: \`${liveS.h1.join(" | ")}\``);
     md(`- test: \`${testS.h1.join(" | ")}\``);
   }
-  if (liveS.schemaTypes.join("|") !== testS.schemaTypes.join("|")) {
-    changes++;
-    const dropped = liveS.schemaTypes.filter(t => !testS.schemaTypes.includes(t));
-    const gained  = testS.schemaTypes.filter(t => !liveS.schemaTypes.includes(t));
-    console.log(chalk.yellow("\n  ↕  Schema.org"));
-    console.log(chalk.gray("     live: ") + (liveS.schemaTypes.join(", ") || "none"));
-    console.log(chalk.gray("     test: ") + (testS.schemaTypes.join(", ") || "none"));
-    if (dropped.length) console.log(chalk.red("     ✖ dropped: ") + dropped.join(", "));
-    if (gained.length)  console.log(chalk.green("     ✚ added:   ") + gained.join(", "));
-    md("**↕ Schema.org**");
-    md(`- live: \`${liveS.schemaTypes.join(", ") || "none"}\``);
-    md(`- test: \`${testS.schemaTypes.join(", ") || "none"}\``);
-    if (dropped.length) md(`- ❌ dropped: ${dropped.join(", ")}`);
-    if (gained.length)  md(`- ✅ added: ${gained.join(", ")}`);
+  {
+    const lS = liveS.schema, tS = testS.schema;
+    const lTypes = Object.keys(lS.counts), tTypes = Object.keys(tS.counts);
+    const allTypes = [...new Set([...lTypes, ...tTypes])].sort();
+    const dropped  = lTypes.filter(t => !tS.counts[t]).sort();
+    const gained   = tTypes.filter(t => !lS.counts[t]).sort();
+    const countChg = allTypes.filter(t => lS.counts[t] && tS.counts[t] && lS.counts[t] !== tS.counts[t]);
+
+    // Rich-result regressions: required props present on live but missing on test (and vice-versa).
+    const reqMissing = (s, t) => s.validation[t] ? Object.keys(s.validation[t].missingRequired) : null;
+    const regressed = [], improved = [];
+    allTypes.forEach(t => {
+      const lv = reqMissing(lS, t), tv = reqMissing(tS, t);
+      if (!lv || !tv) return;
+      const newlyMissing = tv.filter(p => !lv.includes(p));
+      const newlyFixed   = lv.filter(p => !tv.includes(p));
+      if (newlyMissing.length) regressed.push(`${t} (${newlyMissing.join(", ")})`);
+      if (newlyFixed.length)   improved.push(`${t} (${newlyFixed.join(", ")})`);
+    });
+
+    const blockNotes = [];
+    if (lS.parseErrors !== tS.parseErrors) blockNotes.push(`invalid JSON-LD blocks: ${lS.parseErrors} → ${tS.parseErrors}`);
+    if (lS.ctxMissing  !== tS.ctxMissing)  blockNotes.push(`blocks missing @context: ${lS.ctxMissing} → ${tS.ctxMissing}`);
+
+    if (dropped.length || gained.length || countChg.length || regressed.length || improved.length || blockNotes.length) {
+      changes++;
+      console.log(chalk.yellow("\n  ↕  Structured Data"));
+      console.log(chalk.gray("     live: ") + (lTypes.length ? lTypes.sort().join(", ") : "none"));
+      console.log(chalk.gray("     test: ") + (tTypes.length ? tTypes.sort().join(", ") : "none"));
+      if (dropped.length)   console.log(chalk.red  ("     ✖ dropped types: ") + dropped.join(", "));
+      if (gained.length)    console.log(chalk.green("     ✚ added types:   ") + gained.join(", "));
+      countChg.forEach(t => console.log(chalk.yellow(`     # ${t}: `) + `${lS.counts[t]} → ${tS.counts[t]}`));
+      if (regressed.length) console.log(chalk.red  ("     ▼ now missing required: ") + regressed.join(" | "));
+      if (improved.length)  console.log(chalk.green("     ▲ required props fixed: ") + improved.join(" | "));
+      blockNotes.forEach(n => console.log(chalk.yellow("     ⚠ ") + n));
+
+      md("**↕ Structured Data**");
+      md(`- live: \`${lTypes.length ? lTypes.sort().join(", ") : "none"}\``);
+      md(`- test: \`${tTypes.length ? tTypes.sort().join(", ") : "none"}\``);
+      if (dropped.length)   md(`- ❌ dropped types: ${dropped.join(", ")}`);
+      if (gained.length)    md(`- ✅ added types: ${gained.join(", ")}`);
+      countChg.forEach(t => md(`- 🔢 ${t}: ${lS.counts[t]} → ${tS.counts[t]}`));
+      if (regressed.length) md(`- ▼ now missing required: ${regressed.join(" | ")}`);
+      if (improved.length)  md(`- ▲ required props fixed: ${improved.join(" | ")}`);
+      blockNotes.forEach(n => md(`- ⚠ ${n}`));
+    }
   }
   if (!changes) {
     console.log(chalk.green("    ✔ No meta/heading changes"));
@@ -658,6 +841,48 @@ function diffReports(liveS, testS, liveKws, testKws) {
     console.log(chalk.green("    ✔ No significant keyword changes"));
     md("✅ No significant keyword changes");
   }
+
+  // ── Final scorecard — side-by-side so the actual difference is obvious
+  const lr = liveS.render, tr = testS.render;
+  const lcs = liveAudit.contentScore.total, tcs = testAudit.contentScore.total;
+  const rows = [
+    ["Technical SEO",   `${liveAudit.metaScore}/100`,                    `${testAudit.metaScore}/100`,                    liveAudit.metaScore, testAudit.metaScore, "up"],
+    ["Content / SSR",   `${lcs}/100`,                                    `${tcs}/100`,                                    lcs, tcs, "up"],
+    ["Words",           String(liveS.wordCount),                         String(testS.wordCount),                         liveS.wordCount, testS.wordCount, "up"],
+    ["Content density", `${(lr.contentRatio * 100).toFixed(1)}%`,        `${(tr.contentRatio * 100).toFixed(1)}%`,        lr.contentRatio, tr.contentRatio, "up"],
+    ["Page size",       fmtBytes(lr.htmlBytes),                          fmtBytes(tr.htmlBytes),                          lr.htmlBytes, tr.htmlBytes, "down"],
+    ["Bytes / word",    fmtBytes(Math.round(lr.bytesPerWord)),           fmtBytes(Math.round(tr.bytesPerWord)),           lr.bytesPerWord, tr.bytesPerWord, "down"],
+    ["JavaScript",      `${Math.round(lr.scriptRatio * 100)}%`,          `${Math.round(tr.scriptRatio * 100)}%`,          lr.scriptRatio, tr.scriptRatio, "down"],
+    ["Schema types",    String(liveS.schema.types.length),               String(testS.schema.types.length),               liveS.schema.types.length, testS.schema.types.length, "up"],
+    ["Internal links",  String(liveS.links.internal.length),             String(testS.links.internal.length),             liveS.links.internal.length, testS.links.internal.length, "up"],
+    ["Render verdict",  renderVerdict(lr, liveS.wordCount).grade,         renderVerdict(tr, testS.wordCount).grade,         0, 0, "none"],
+  ];
+
+  const winner = (lv, tv, dir) => {
+    if (dir === "none" || lv === tv) return "=";
+    return (dir === "up" ? tv > lv : tv < lv) ? "test" : "live";
+  };
+
+  console.log("\n" + chalk.bgGreen.black.bold(" ── SCORECARD: live vs test ── "));
+  console.log("  " + chalk.gray("Metric".padEnd(17) + "LIVE".padEnd(13) + "TEST".padEnd(13) + "Winner"));
+  md(`\n---\n\n## Scorecard: live vs test\n`);
+  md("| Metric | LIVE | TEST | Winner |");
+  md("|---|---|---|---|");
+  let testWins = 0, liveWins = 0;
+  rows.forEach(([name, lvS, tvS, lv, tv, dir]) => {
+    const w = winner(lv, tv, dir);
+    if (w === "test") testWins++; else if (w === "live") liveWins++;
+    const tag = w === "test" ? chalk.green("→ test") : w === "live" ? chalk.yellow("→ live") : chalk.gray("=");
+    console.log("  " + chalk.cyan(name.padEnd(17)) + String(lvS).padEnd(13) + String(tvS).padEnd(13) + tag);
+    md(`| ${name} | ${lvS} | ${tvS} | ${w === "test" ? "→ **test**" : w === "live" ? "→ live" : "="} |`);
+  });
+
+  const fmtDelta = d => d > 0 ? chalk.green(`+${d}`) : d < 0 ? chalk.red(`${d}`) : chalk.gray("±0");
+  const dTech = testAudit.metaScore - liveAudit.metaScore;
+  const dCont = tcs - lcs;
+  console.log("\n  " + chalk.bold(`Net  →  Technical SEO ${fmtDelta(dTech)}   ·   Content/SSR ${fmtDelta(dCont)}`)
+    + chalk.gray(`   (test wins ${testWins}, live wins ${liveWins})`));
+  md(`\n> **Net:** Technical SEO ${dTech >= 0 ? "+" : ""}${dTech}, Content/SSR ${dCont >= 0 ? "+" : ""}${dCont} — test wins ${testWins}, live wins ${liveWins}.\n`);
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
@@ -678,7 +903,7 @@ function diffReports(liveS, testS, liveKws, testKws) {
     console.log(chalk.green(" ✔"));
 
     const live$       = cheerio.load(liveHtml);
-    const liveSignals = extractSignals(live$, liveFinal);
+    const liveSignals = extractSignals(live$, liveFinal, liveHtml);
     const liveKws     = scoreKeywords(liveSignals);
     const liveAudit   = seoAudit(liveSignals);
     printReport("LIVE", liveFinal, liveSignals, liveKws, liveAudit);
@@ -689,12 +914,12 @@ function diffReports(liveS, testS, liveKws, testKws) {
       console.log(chalk.green(" ✔"));
 
       const test$       = cheerio.load(testHtml);
-      const testSignals = extractSignals(test$, testFinal);
+      const testSignals = extractSignals(test$, testFinal, testHtml);
       const testKws     = scoreKeywords(testSignals);
       const testAudit   = seoAudit(testSignals);
       printReport("TEST", testFinal, testSignals, testKws, testAudit);
 
-      diffReports(liveSignals, testSignals, liveKws, testKws);
+      diffReports(liveSignals, testSignals, liveKws, testKws, liveAudit, testAudit);
     }
 
     saveMd();

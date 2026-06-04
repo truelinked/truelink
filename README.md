@@ -34,9 +34,10 @@ Fetches your page via SSR (raw HTML, no JS execution), strips all the React/Next
 | 📋 **Full meta audit** | Title, description, canonical, robots, hreflang, og:*, twitter:card |
 | 🏷️ **Structured data validator** | Recursively parses every JSON-LD block (incl. `@graph`, arrays, nested entities) + Microdata/RDFa, then checks each type against Google rich-result required/recommended properties |
 | 🔗 **Link analysis** | Internal vs external link counts |
-| 🆚 **Live vs test diff** | Keywords added, removed, risen, fallen — signal changes highlighted |
+| 📦 **SSR readiness** | Page size, text-to-HTML ratio, and CSR-shell detection — catches content that only exists after client-side JS |
+| 🆚 **Live vs test diff** | Keywords + schema + **indexable-content** changes (word count, text ratio, content score) highlighted |
 | 📄 **Markdown report** | Saved to your current folder as `truelink_YYYY-MM-DD_HH-MM-SS.md` |
-| 🎯 **SEO score** | 0–100 score based on audit passes/warnings/issues |
+| 🎯 **Two scores** | **Technical SEO** (tag/meta hygiene) and **Content / SSR readiness** (how much real content is in the raw HTML) — kept separate so good tags can't mask a thin CSR page |
 
 ---
 
@@ -93,6 +94,10 @@ Fetching LIVE: https://yoursite.com/en ... ✔
   Canonical         https://yoursite.com/en
   Schema            WebSite, Organization, BreadcrumbList  (3 types, 1 JSON-LD block)
   Word count        324
+  Payload           48.2 KB · 152 B/word · 61% JS
+  Content density   14.6% text vs markup
+  Render            Next.js · LEAN
+    152 B per word, 61% JavaScript — content-first HTML, crawler-friendly.
 
   ── Top 40 Keywords (weighted TF-IDF) ────
    1. opera                   ████████████████████████  21.17
@@ -113,8 +118,49 @@ Fetching LIVE: https://yoursite.com/en ... ✔
     ✖ BreadcrumbList: missing required itemListElement — not eligible for rich results
     ✔ og:title present
     ✔ 57 internal links
+    ✔ LEAN: 152 B per word, 61% JavaScript — content-first HTML, crawler-friendly.
 
-  SEO Score: 91/100
+  Technical SEO (tags/meta): 91/100
+  Content / SSR readiness:   83/100   (density 36/45 · content 30/35 · headings 12/12 · links 5/8)
+```
+
+### Why two scores?
+
+`Technical SEO` measures **tag hygiene** — is the title/description/canonical/og/schema correct. A page can score 90+ here while being nearly empty, because all it checks is that the right tags exist.
+
+`Content / SSR readiness` measures **how much real, indexable content is in the raw HTML** — what a crawler sees with **no JavaScript executed**. It reports it bluntly: **bytes of HTML shipped per indexable word** and **% of the page that is JavaScript**, plus a one-line verdict (`LEAN` / `HEAVY` / `BLOATED` / `CSR SHELL`). A client-side-rendered page ships an empty shell behind a big JS bundle, so it lands a brutal bytes-per-word number and a low score even when the tags are perfect. We deliberately avoid a single text/total-HTML percentage — real JS apps pin that near 0%, and a number that never moves gets ignored.
+
+| Verdict | Meaning |
+|---|---|
+| `LEAN` | Content-first HTML, crawler-friendly |
+| `HEAVY` | Content is present but buried under markup/JS — trim the payload |
+| `BLOATED` | You're shipping a JS bundle to surface a paragraph (>2 KB/word or ≥90% JS) |
+| `CSR SHELL` | The content isn't server-rendered at all — a crawler sees an empty shell |
+
+```
+  ── Indexable content & payload
+     ▲ words:          233 → 1536  (6.6×)
+     ▼ page size:      351.6 KB → 2.50 MB
+     ▼ bytes/word:     1.5 KB → 1.7 KB
+     ▲ content score:  32 → 58
+```
+
+Every run with two URLs ends with a **side-by-side scorecard** so the actual difference is unambiguous — including when "newer" isn't strictly "better":
+
+```
+ ── SCORECARD: live vs test ──
+  Metric           LIVE         TEST         Winner
+  Technical SEO    88/100       85/100       → live
+  Content / SSR    32/100       50/100       → test
+  Words            233          1536         → test
+  Page size        351.6 KB     2.50 MB      → live
+  Bytes / word     1.5 KB       1.7 KB       → live
+  JavaScript       87%          92%          → live
+  Schema types     9            9            =
+  Internal links   48           283          → test
+  Render verdict   HEAVY        BLOATED      =
+
+  Net  →  Technical SEO -3   ·   Content/SSR +18   (test wins 4, live wins 4)
 ```
 
 ### Markdown file
