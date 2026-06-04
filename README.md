@@ -34,10 +34,10 @@ Fetches your page via SSR (raw HTML, no JS execution), strips all the React/Next
 | 📋 **Full meta audit** | Title, description, canonical, robots, hreflang, og:*, twitter:card |
 | 🏷️ **Structured data validator** | Recursively parses every JSON-LD block (incl. `@graph`, arrays, nested entities) + Microdata/RDFa, then checks each type against Google rich-result required/recommended properties |
 | 🔗 **Link analysis** | Internal vs external link counts |
-| 📦 **SSR readiness** | Page size, text-to-HTML ratio, and CSR-shell detection — catches content that only exists after client-side JS |
-| 🆚 **Live vs test diff** | Keywords + schema + **indexable-content** changes (word count, text ratio, content score) highlighted |
+| 📦 **SSR readiness** | Page size, bytes per word, content density, % JavaScript, and a blunt render verdict (`LEAN` / `HEAVY` / `BLOATED` / `CSR SHELL`) |
+| 🆚 **Live vs test diff** | Keywords + schema + **indexable-content/payload** changes (words, content density, page size, bytes/word, content score) highlighted |
 | 📄 **Markdown report** | Saved to your current folder as `truelink_YYYY-MM-DD_HH-MM-SS.md` |
-| 🎯 **Two scores** | **Technical SEO** (tag/meta hygiene) and **Content / SSR readiness** (how much real content is in the raw HTML) — kept separate so good tags can't mask a thin CSR page |
+| 🎯 **Two scores** | **Technical SEO** (tag/meta hygiene) and **Content / SSR readiness** (real content plus payload quality in the raw HTML) — kept separate so good tags can't mask bad rendering |
 
 ---
 
@@ -221,7 +221,7 @@ truelink uses a weighted TF-IDF pipeline, not a simple word count:
 - ❌ Crawl multiple pages (run it per-page)
 - ❌ Replace a full SEO platform
 
-It does one thing really well: **tell you exactly what keywords are in your SSR HTML and whether they changed.**
+It does one thing really well: **tell you what a crawler actually gets from the raw HTML, and whether live → test made that better or worse.**
 
 ---
 
