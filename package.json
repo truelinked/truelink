@@ -1,6 +1,6 @@
 {
     "name": "truelink",
-    "version": "1.1.0",
+    "version": "1.2.0",
     "description": "SEO keyword extractor and diff tool",
     "bin": {
         "truelink": "./index.js"
