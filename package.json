@@ -2,11 +2,25 @@
     "name": "truelink",
     "version": "1.0.0",
     "description": "SEO keyword extractor and diff tool",
-    "bin": { "truelink": "./index.js" },
+    "bin": {
+        "truelink": "./index.js"
+    },
     "license": "MIT",
-    "keywords": ["seo", "keyword", "diff", "tfidf"],
+    "keywords": [
+        "seo",
+        "keyword",
+        "diff",
+        "tfidf"
+    ],
     "repository": {
-      "type": "git",
-      "url": "https://github.com/you/truelink"
+        "type": "git",
+        "url": "https://github.com/truelinked/truelink"
+    },
+    "dependencies": {
+        "axios": "^1.6.0",
+        "cheerio": "^1.0.0",
+        "natural": "^6.10.0",
+        "chalk": "^4.1.2",
+        "stopword": "^2.0.8"
     }
-  }
+}
